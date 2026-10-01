@@ -32,7 +32,7 @@ use aggligator::{
 use aggligator_monitor::monitor::{interactive_monitor, watch_tags};
 use aggligator_transport_socks::{Socks5Connector, Socks5Target};
 use aggligator_transport_tcp::{IpVersion, TcpAcceptor, TcpConnector, TcpLinkFilter};
-use aggligator_util::{init_log, load_cfg, parse_tcp_link_filter, print_default_cfg, wait_sigterm};
+use aggligator_util::{AnyTlsArgs, init_log, load_cfg, parse_tcp_link_filter, print_default_cfg, wait_sigterm};
 
 #[cfg(feature = "bluer")]
 use aggligator_transport_bluer::rfcomm::{RfcommAcceptor, RfcommConnector};
@@ -80,7 +80,7 @@ pub struct TunnelCli {
 #[derive(Subcommand)]
 enum Commands {
     /// Tunnel client.
-    Client(ClientCli),
+    Client(Box<ClientCli>),
     /// Tunnel server.
     Server(ServerCli),
     /// Shows the default configuration.
@@ -171,6 +171,8 @@ pub struct ClientCli {
     /// Defaults to the first TCP target.
     #[arg(long)]
     socks_target: Option<String>,
+    #[command(flatten)]
+    anytls: AnyTlsArgs,
     /// Bluetooth RFCOMM server address.
     #[cfg(feature = "bluer")]
     #[arg(long)]
@@ -237,6 +239,12 @@ impl ClientCli {
         } else {
             None
         };
+
+        let anytls_connector = self.anytls.connector(self.tcp.first().map(String::as_str), TCP_PORT)?;
+        if let Some(anytls) = &anytls_connector {
+            targets.push(anytls.to_string());
+            watch_conn.push(Box::new(anytls.clone()));
+        }
 
         #[cfg(feature = "bluer")]
         let rfcomm_connector = match self.rfcomm {
@@ -330,6 +338,7 @@ impl ClientCli {
             let port_cfg = cfg.clone();
             let tcp_connector = tcp_connector.clone();
             let socks_connector = socks_connector.clone();
+            let anytls_connector = anytls_connector.clone();
             #[cfg(feature = "bluer")]
             let rfcomm_connector = rfcomm_connector.clone();
             #[cfg(feature = "usb-host")]
@@ -354,6 +363,9 @@ impl ClientCli {
                         connector.add(c);
                     }
                     if let Some(c) = socks_connector.clone() {
+                        connector.add(c);
+                    }
+                    if let Some(c) = anytls_connector.clone() {
                         connector.add(c);
                     }
                     #[cfg(feature = "bluer")]

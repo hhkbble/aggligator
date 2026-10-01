@@ -55,6 +55,7 @@ native event queue.
 ## Companion crates
 
 The following [crates provide transports]:
+  * [aggligator-transport-anytls] — transport through AnyTLS servers,
   * [aggligator-transport-bluer] — transport over Bluetooth on Linux,
   * [aggligator-transport-socks] — transport through SOCKS5 proxies,
   * [aggligator-transport-tcp] — transport over TCP with optional TLS encryption,
@@ -64,6 +65,7 @@ The following [crates provide transports]:
   * [aggligator-transport-websocket-web] — transport over WebSockets for the web targeting WebAssembly.
 
 [crates provide transports]: https://crates.io/keywords/aggligator-transport
+[aggligator-transport-anytls]: https://crates.io/crates/aggligator-transport-anytls
 [aggligator-transport-bluer]: https://crates.io/crates/aggligator-transport-bluer
 [aggligator-transport-socks]: https://crates.io/crates/aggligator-transport-socks
 [aggligator-transport-tcp]: https://crates.io/crates/aggligator-transport-tcp

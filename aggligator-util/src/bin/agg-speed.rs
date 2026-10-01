@@ -37,7 +37,7 @@ use aggligator_monitor::{
 use aggligator_transport_socks::{Socks5Connector, Socks5Target};
 use aggligator_transport_tcp::{IpVersion, TcpAcceptor, TcpConnector, TcpLinkFilter};
 use aggligator_transport_websocket::{WebSocketAcceptor, WebSocketConnector};
-use aggligator_util::{init_log, load_cfg, parse_tcp_link_filter, print_default_cfg, wait_sigterm};
+use aggligator_util::{AnyTlsArgs, init_log, load_cfg, parse_tcp_link_filter, print_default_cfg, wait_sigterm};
 use aggligator_wrapper_tls::{TlsClient, TlsServer};
 
 #[cfg(feature = "bluer")]
@@ -175,7 +175,7 @@ pub struct SpeedCli {
 #[derive(Subcommand)]
 enum Commands {
     /// Aggregated links speed test client.
-    Client(ClientCli),
+    Client(Box<ClientCli>),
     /// Aggregated links speed test server.
     Server(ServerCli),
     /// Shows the default configuration.
@@ -279,6 +279,8 @@ pub struct ClientCli {
     /// Defaults to the first TCP target.
     #[arg(long)]
     socks_target: Option<String>,
+    #[command(flatten)]
+    anytls: AnyTlsArgs,
     /// WebSocket hosts or URLs.
     ///
     /// Default server port number is 8080 and path is /agg-speed.
@@ -313,6 +315,10 @@ impl ClientCli {
     pub async fn run(mut self, cfg: Cfg, dump: Option<PathBuf>) -> Result<()> {
         if !stdout().is_tty() {
             self.no_monitor = true;
+        }
+
+        if self.tls && self.anytls.is_enabled() {
+            bail!("--tls cannot be used together with --anytls");
         }
 
         let mut builder = ConnectorBuilder::new(cfg);
@@ -352,6 +358,11 @@ impl ClientCli {
                 Socks5Connector::new(self.socks.clone(), target).context("cannot use SOCKS5 proxies")?;
             targets.push(socks_connector.to_string());
             connector.add(socks_connector);
+        }
+
+        if let Some(anytls_connector) = self.anytls.connector(self.tcp.first().map(String::as_str), TCP_PORT)? {
+            targets.push(anytls_connector.to_string());
+            connector.add(anytls_connector);
         }
 
         #[cfg(feature = "bluer")]

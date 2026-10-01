@@ -22,6 +22,7 @@ raw-speed-cli = []
 [dependencies]
 aggligator = { version = "0.12.0", path = "../aggligator", features = ["dump"] }
 aggligator-monitor = { version = "0.12.0", path = "../aggligator-monitor" }
+aggligator-transport-anytls = { version = "0.1.0", path = "../aggligator-transport-anytls" }
 aggligator-transport-bluer = { version = "0.4.0", path = "../aggligator-transport-bluer", optional = true }
 aggligator-transport-socks = { version = "0.3.0", path = "../aggligator-transport-socks" }
 aggligator-transport-tcp = { version = "0.6.0", path = "../aggligator-transport-tcp" }
@@ -53,6 +54,7 @@ rustls = "0.23"
 rustls-pemfile = "2.0"
 socket2 = "0.6"
 tracing-log = "0.2"
+webpki-roots = "1"
 
 [[bin]]
 name = "agg-speed"
