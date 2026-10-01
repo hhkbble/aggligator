@@ -20,6 +20,9 @@
 //! ([`SessionPolicy::Exclusive`], the default) or is reused by links of other
 //! Aggligator connections.
 //!
+//! TLS connections are made with BoringSSL and send the ClientHello of Chrome 133,
+//! see [`chrome_connector_builder`].
+//!
 //! Only the client side of the protocol is implemented. UDP over TCP is not supported.
 
 use aggligator::{
@@ -28,6 +31,7 @@ use aggligator::{
     transport::{ConnectingTransport, LinkTag, LinkTagBox},
 };
 use async_trait::async_trait;
+use boring::ssl::SslVerifyMode;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -45,19 +49,20 @@ use tokio::{
     sync::watch,
     time::sleep,
 };
-use tokio_rustls::TlsConnector;
 
 mod addr;
 mod frame;
+mod hello;
 mod padding;
 mod pool;
 mod session;
 mod stream;
 
 pub use addr::AnyTlsTarget;
-pub use padding::DEFAULT_PADDING_SCHEME;
 #[doc(no_inline)]
-pub use rustls::{ClientConfig, pki_types::ServerName};
+pub use boring::ssl::SslConnector;
+pub use hello::chrome_connector_builder;
+pub use padding::DEFAULT_PADDING_SCHEME;
 
 use addr::{host_part, with_default_port};
 use padding::PaddingSlot;
@@ -150,8 +155,8 @@ pub struct AnyTlsCfg {
     /// TLS server name used for all servers.
     ///
     /// If unset, the configured server hostname is used, or the server IP address
-    /// if the server was specified by IP address.
-    pub server_name: Option<ServerName<'static>>,
+    /// if the server was specified by IP address. No SNI is sent for an IP address.
+    pub server_name: Option<String>,
     /// Session policy.
     pub policy: SessionPolicy,
     /// Interval for re-resolving the server hostnames.
@@ -177,7 +182,7 @@ pub struct AnyTlsLinkTag {
     /// TLS server name, if the server address was resolved from a hostname.
     ///
     /// [`AnyTlsCfg::server_name`] takes precedence; without either, the server IP address is used.
-    pub server_name: Option<ServerName<'static>>,
+    pub server_name: Option<String>,
 }
 
 impl AnyTlsLinkTag {
@@ -267,7 +272,7 @@ struct State {
     servers: Vec<String>,
     target: AnyTlsTarget,
     password_hash: [u8; 32],
-    tls: TlsConnector,
+    tls: SslConnector,
     cfg: AnyTlsCfg,
     pools: Mutex<HashMap<SocketAddr, Arc<Pool<Session>>>>,
     padding: Mutex<HashMap<SocketAddr, Arc<PaddingSlot>>>,
@@ -303,12 +308,14 @@ impl AnyTlsConnector {
     /// resolved IP address. Resolution is retried periodically.
     ///
     /// `target` is the Aggligator TCP acceptor the servers should connect to.
-    /// `tls` is used to establish TLS connections to the servers.
+    /// `tls` is used to establish TLS connections to the servers; build it from
+    /// [`chrome_connector_builder`]. Hostname verification is disabled when `tls`
+    /// does not verify certificates.
     ///
     /// It is *not* checked at creation that the servers can be resolved.
     pub fn new(
         servers: impl IntoIterator<Item = impl AsRef<str>>, target: AnyTlsTarget, password: &str,
-        tls: Arc<ClientConfig>, cfg: AnyTlsCfg,
+        tls: SslConnector, cfg: AnyTlsCfg,
     ) -> Result<Self> {
         let servers: Vec<_> =
             servers.into_iter().map(|server| with_default_port(server.as_ref(), DEFAULT_SERVER_PORT)).collect();
@@ -330,7 +337,7 @@ impl AnyTlsConnector {
                 servers,
                 target,
                 password_hash: password_hash(password),
-                tls: TlsConnector::from(tls),
+                tls,
                 cfg,
                 pools: Mutex::new(HashMap::new()),
                 padding: Mutex::new(HashMap::new()),
@@ -362,7 +369,7 @@ impl AnyTlsConnector {
                     let host = host_part(server);
                     let server_name = match host.parse::<IpAddr>() {
                         Ok(_) => None,
-                        Err(_) => ServerName::try_from(host.to_string()).ok(),
+                        Err(_) => Some(host.to_string()),
                     };
                     for addr in addrs {
                         tags.entry(addr).or_insert_with(|| AnyTlsLinkTag {
@@ -379,13 +386,13 @@ impl AnyTlsConnector {
         tags.into_values().collect()
     }
 
-    fn server_name(&self, tag: &AnyTlsLinkTag) -> ServerName<'static> {
+    fn server_name(&self, tag: &AnyTlsLinkTag) -> String {
         self.state
             .cfg
             .server_name
             .clone()
             .or_else(|| tag.server_name.clone())
-            .unwrap_or_else(|| ServerName::from(tag.server.ip()))
+            .unwrap_or_else(|| tag.server.ip().to_string())
     }
 
     fn padding_slot(&self, server: SocketAddr) -> Arc<PaddingSlot> {
@@ -420,7 +427,11 @@ impl AnyTlsConnector {
     async fn dial(&self, tag: &AnyTlsLinkTag, exclusive: bool) -> Result<Arc<Session>> {
         let tcp = TcpStream::connect(tag.server).await?;
         let _ = tcp.set_nodelay(true);
-        let tls = self.state.tls.connect(self.server_name(tag), tcp).await?;
+        let tls = &self.state.tls;
+        let config = hello::configure(tls, tls.context().verify_mode() != SslVerifyMode::NONE)?;
+        let tls = tokio_boring::connect(config, &self.server_name(tag), tcp).await.map_err(|err| {
+            Error::new(err.as_io_error().map_or(ErrorKind::InvalidData, Error::kind), err.to_string())
+        })?;
         Session::start(tls, &self.state.password_hash, self.padding_slot(tag.server), exclusive).await
     }
 

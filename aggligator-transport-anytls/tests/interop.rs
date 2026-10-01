@@ -25,61 +25,26 @@ use aggligator::{
     transport::ConnectingTransport,
 };
 use aggligator_transport_anytls::{
-    AnyTlsCfg, AnyTlsConnector, AnyTlsLinkTag, AnyTlsTarget, ClientConfig, ReuseCfg, ServerName, SessionPolicy,
-    SynAckTimeoutAction,
+    AnyTlsCfg, AnyTlsConnector, AnyTlsLinkTag, AnyTlsTarget, ReuseCfg, SessionPolicy, SslConnector,
+    SynAckTimeoutAction, chrome_connector_builder,
 };
-use rustls::{
-    DigitallySignedStruct, RootCertStore, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, UnixTime},
+use boring::{
+    ssl::SslVerifyMode,
+    x509::{X509, store::X509StoreBuilder},
 };
-use std::{env, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{env, net::SocketAddr, num::NonZeroUsize, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::lookup_host,
     time::{sleep, timeout},
 };
 
-#[derive(Debug)]
-struct NullVerifier;
-
-impl ServerCertVerifier for NullVerifier {
-    fn verify_server_cert(
-        &self, _end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::CryptoProvider::get_default()
-            .map(|provider| provider.signature_verification_algorithms.supported_schemes())
-            .unwrap_or_else(|| {
-                rustls::crypto::aws_lc_rs::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            })
-    }
-}
-
 struct Env {
     server: SocketAddr,
     password: String,
     target: AnyTlsTarget,
-    sni: Option<ServerName<'static>>,
-    tls: Arc<ClientConfig>,
+    sni: Option<String>,
+    tls: SslConnector,
 }
 
 async fn env() -> Env {
@@ -87,16 +52,19 @@ async fn env() -> Env {
 
     let server = lookup_host(var("ANYTLS_SERVER")).await.unwrap().next().expect("cannot resolve ANYTLS_SERVER");
     let target = AnyTlsTarget::parse(&var("ANYTLS_ECHO_TARGET"), 7).unwrap();
-    let sni = env::var("ANYTLS_SNI").ok().map(|sni| ServerName::try_from(sni).unwrap());
+    let sni = env::var("ANYTLS_SNI").ok();
 
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut tls = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let mut roots = X509StoreBuilder::new().unwrap();
+    for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        roots.add_cert(X509::from_der(cert).unwrap()).unwrap();
+    }
+    let mut tls = chrome_connector_builder().unwrap();
+    tls.set_cert_store(roots.build());
     if env::var("ANYTLS_INSECURE").as_deref() == Ok("1") {
-        tls.dangerous().set_certificate_verifier(Arc::new(NullVerifier));
+        tls.set_verify(SslVerifyMode::NONE);
     }
 
-    Env { server, password: var("ANYTLS_PASSWORD"), target, sni, tls: Arc::new(tls) }
+    Env { server, password: var("ANYTLS_PASSWORD"), target, sni, tls: tls.build() }
 }
 
 impl Env {

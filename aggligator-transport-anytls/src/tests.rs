@@ -1,8 +1,7 @@
 use super::*;
-use rustls::RootCertStore;
 
-fn tls() -> Arc<ClientConfig> {
-    Arc::new(ClientConfig::builder().with_root_certificates(RootCertStore::empty()).with_no_client_auth())
+fn tls() -> SslConnector {
+    chrome_connector_builder().unwrap().build()
 }
 
 fn target() -> AnyTlsTarget {
@@ -96,24 +95,23 @@ async fn publishes_one_link_for_each_server_address() {
 
 #[tokio::test]
 async fn server_name_follows_configuration() {
-    let localhost = ServerName::try_from("localhost").unwrap();
     let loopback = SocketAddr::from(([127, 0, 0, 1], 443));
     let ip_server = SocketAddr::from(([127, 0, 0, 2], 443));
 
     let connector = connector(&["localhost", "127.0.0.2"], AnyTlsCfg::default());
     let tags = connector.resolve().await;
     let tag = |addr| tags.iter().find(|tag| tag.server == addr).unwrap();
-    assert_eq!(connector.server_name(tag(ip_server)), ServerName::from(ip_server.ip()));
-    assert_eq!(connector.server_name(tag(loopback)), localhost);
+    assert_eq!(connector.server_name(tag(ip_server)), "127.0.0.2");
+    assert_eq!(connector.server_name(tag(loopback)), "localhost");
 
     // An address resolved from several servers takes the name of the first one.
     let connector = self::connector(&["127.0.0.1", "localhost"], AnyTlsCfg::default());
     let tags = connector.resolve().await;
     let tag = tags.iter().find(|tag| tag.server == loopback).unwrap();
     assert_eq!(tag.server_name, None);
-    assert_eq!(connector.server_name(tag), ServerName::from(loopback.ip()));
+    assert_eq!(connector.server_name(tag), "127.0.0.1");
 
-    let sni = ServerName::try_from("sni.example").unwrap();
+    let sni = "sni.example".to_string();
     let connector =
         self::connector(&["localhost"], AnyTlsCfg { server_name: Some(sni.clone()), ..Default::default() });
     let tags = connector.resolve().await;
@@ -124,11 +122,12 @@ async fn server_name_follows_configuration() {
 fn server_name_is_not_part_of_tag_identity() {
     let server = SocketAddr::from(([127, 0, 0, 1], 443));
     let plain = AnyTlsLinkTag::new(server, target());
-    let named = AnyTlsLinkTag { server_name: Some(ServerName::try_from("localhost").unwrap()), ..plain.clone() };
+    let named = AnyTlsLinkTag { server_name: Some("localhost".into()), ..plain.clone() };
     assert_eq!(plain, named);
 
     let tags: HashSet<LinkTagBox> = [Box::new(plain) as LinkTagBox, Box::new(named) as LinkTagBox].into();
     assert_eq!(tags.len(), 1);
 }
 
+mod hello;
 mod loopback;

@@ -20,8 +20,14 @@ Optionally, TLS connections can be shared by the links of different Aggligator c
 limited either by the number of TLS connections per server IP address or by the number
 of links per TLS connection. Idle shared connections are closed after a timeout.
 
-Not supported: accepting AnyTLS connections, UDP over TCP, uTLS fingerprints,
-ShadowTLS and Reality.
+TLS connections are made with BoringSSL and send the ClientHello of Chrome 133, the same
+as uTLS `HelloChrome_Auto` and mihomo with `client-fingerprint: chrome`. On CPUs without
+AES hardware support, BoringSSL puts ChaCha20-Poly1305 first among the TLS 1.3 cipher suites,
+which differs from Chrome's order.
+
+Building BoringSSL requires CMake, Clang (libclang) and git; on Windows also NASM.
+
+Not supported: accepting AnyTLS connections, UDP over TCP, ShadowTLS and Reality.
 
 Do not wrap this transport in the Aggligator TLS wrapper; AnyTLS already uses TLS.
 

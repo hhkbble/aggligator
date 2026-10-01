@@ -9,17 +9,17 @@
 //! Aggligator command line utilities.
 
 use anyhow::{Context, bail};
-use rustls::{
-    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, ServerName, UnixTime},
+use boring::{
+    ssl::SslVerifyMode,
+    x509::{X509, store::X509StoreBuilder},
 };
-use std::{fs::File, io::BufReader, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, path::PathBuf, time::Duration};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use aggligator::cfg::Cfg;
 use aggligator_transport_anytls::{
-    AnyTlsCfg, AnyTlsConnector, AnyTlsTarget, ReuseCfg, SessionPolicy, SynAckTimeoutAction,
+    AnyTlsCfg, AnyTlsConnector, AnyTlsTarget, ReuseCfg, SessionPolicy, SslConnector, SynAckTimeoutAction,
+    chrome_connector_builder,
 };
 use aggligator_transport_tcp::TcpLinkFilter;
 
@@ -53,49 +53,6 @@ pub fn parse_tcp_link_filter(s: &str) -> anyhow::Result<TcpLinkFilter> {
         "interface-interface" => Ok(TcpLinkFilter::InterfaceInterface),
         "interface-ip" => Ok(TcpLinkFilter::InterfaceIp),
         other => bail!("unknown TCP link filter: {other}"),
-    }
-}
-
-/// Accepts every TLS server certificate, for `--anytls-insecure`.
-#[derive(Debug)]
-struct TlsNullVerifier;
-
-impl ServerCertVerifier for TlsNullVerifier {
-    fn verify_server_cert(
-        &self, _end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA1,
-            SignatureScheme::ECDSA_SHA1_Legacy,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-        ]
     }
 }
 
@@ -197,13 +154,10 @@ impl AnyTlsArgs {
         let password =
             self.anytls_password.as_deref().context("specify the AnyTLS password using --anytls-password")?;
 
-        let server_name = match &self.anytls_sni {
-            Some(sni) => Some(ServerName::try_from(sni.clone()).context("invalid AnyTLS server name")?),
-            None => None,
-        };
-        let cfg = AnyTlsCfg { server_name, policy: self.policy()?, ..Default::default() };
+        let cfg =
+            AnyTlsCfg { server_name: self.anytls_sni.clone(), policy: self.policy()?, ..Default::default() };
 
-        let connector = AnyTlsConnector::new(&self.anytls, target, password, Arc::new(self.tls_config()?), cfg)
+        let connector = AnyTlsConnector::new(&self.anytls, target, password, self.tls_config()?, cfg)
             .context("cannot use AnyTLS servers")?;
         Ok(Some(connector))
     }
@@ -259,21 +213,24 @@ impl AnyTlsArgs {
         }
     }
 
-    fn tls_config(&self) -> anyhow::Result<ClientConfig> {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    fn tls_config(&self) -> anyhow::Result<SslConnector> {
+        let mut roots = X509StoreBuilder::new()?;
+        for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+            roots.add_cert(X509::from_der(cert)?)?;
+        }
         if let Some(path) = &self.anytls_root_cert {
-            let file = File::open(path).context("cannot open AnyTLS root certificate file")?;
-            for cert in rustls_pemfile::certs(&mut BufReader::new(file)) {
-                roots.add(cert.context("cannot parse AnyTLS root certificate")?)?;
+            let pem = std::fs::read(path).context("cannot open AnyTLS root certificate file")?;
+            for cert in X509::stack_from_pem(&pem).context("cannot parse AnyTLS root certificate")? {
+                roots.add_cert(cert)?;
             }
         }
 
-        let mut cfg = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let mut tls = chrome_connector_builder()?;
+        tls.set_cert_store(roots.build());
         if self.anytls_insecure {
-            cfg.dangerous().set_certificate_verifier(Arc::new(TlsNullVerifier));
+            tls.set_verify(SslVerifyMode::NONE);
         }
-        Ok(cfg)
+        Ok(tls.build())
     }
 }
 

@@ -1,9 +1,10 @@
 //! Connector tests against a local fake AnyTLS server over TLS.
 
 use super::*;
+use boring::x509::{X509, store::X509StoreBuilder};
 use bytes::BytesMut;
 use rustls::{
-    RootCertStore, ServerConfig,
+    ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -23,11 +24,12 @@ struct Stats {
     connections: AtomicUsize,
     closed: AtomicUsize,
     max_stream_id: AtomicUsize,
+    server_names: Mutex<Vec<Option<String>>>,
 }
 
 struct FakeServer {
     addr: SocketAddr,
-    tls: Arc<ClientConfig>,
+    tls: SslConnector,
     stats: Arc<Stats>,
 }
 
@@ -38,13 +40,13 @@ impl FakeServer {
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
-        let server_cfg = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], key_der)
-            .unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(cert_der).unwrap();
-        let tls = Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let server_cfg =
+            ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert_der], key_der).unwrap();
+        let mut roots = X509StoreBuilder::new().unwrap();
+        roots.add_cert(X509::from_der(cert.cert.der()).unwrap()).unwrap();
+        let mut tls = chrome_connector_builder().unwrap();
+        tls.set_cert_store(roots.build());
+        let tls = tls.build();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -59,7 +61,9 @@ impl FakeServer {
                     let acceptor = acceptor.clone();
                     let stats = stats.clone();
                     tokio::spawn(async move {
-                        let tls = acceptor.accept(tcp).await.unwrap();
+                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        let server_name = tls.get_ref().1.server_name().map(String::from);
+                        stats.server_names.lock().unwrap().push(server_name);
                         stats.connections.fetch_add(1, AtomicOrdering::SeqCst);
                         serve(tls, &stats).await;
                         stats.closed.fetch_add(1, AtomicOrdering::SeqCst);
@@ -72,12 +76,12 @@ impl FakeServer {
     }
 
     fn connector(&self, policy: SessionPolicy) -> AnyTlsConnector {
-        let cfg = AnyTlsCfg {
-            server_name: Some(ServerName::try_from("localhost").unwrap()),
-            policy,
-            ..Default::default()
-        };
-        AnyTlsConnector::new([self.addr.to_string()], target(), PASSWORD, self.tls.clone(), cfg).unwrap()
+        self.connector_with(self.tls.clone(), "localhost", policy)
+    }
+
+    fn connector_with(&self, tls: SslConnector, server_name: &str, policy: SessionPolicy) -> AnyTlsConnector {
+        let cfg = AnyTlsCfg { server_name: Some(server_name.into()), policy, ..Default::default() };
+        AnyTlsConnector::new([self.addr.to_string()], target(), PASSWORD, tls, cfg).unwrap()
     }
 
     fn tag(&self) -> AnyTlsLinkTag {
@@ -91,6 +95,24 @@ impl FakeServer {
     fn closed(&self) -> usize {
         self.stats.closed.load(AtomicOrdering::SeqCst)
     }
+
+    fn server_names(&self) -> Vec<Option<String>> {
+        self.stats.server_names.lock().unwrap().clone()
+    }
+}
+
+/// TLS connector trusting only the webpki roots, optionally without verification.
+fn webpki_tls(insecure: bool) -> SslConnector {
+    let mut roots = X509StoreBuilder::new().unwrap();
+    for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        roots.add_cert(X509::from_der(cert).unwrap()).unwrap();
+    }
+    let mut tls = chrome_connector_builder().unwrap();
+    tls.set_cert_store(roots.build());
+    if insecure {
+        tls.set_verify(SslVerifyMode::NONE);
+    }
+    tls.build()
 }
 
 /// Serves one session until the client closes it.
@@ -183,6 +205,53 @@ async fn exclusive_uses_one_connection_per_link() {
     drop(a);
     wait_until(|| server.closed() == 1).await;
     echo(&mut b, b"still here").await;
+}
+
+#[tokio::test]
+async fn rejects_untrusted_certificate_and_wrong_hostname() {
+    let server = FakeServer::start().await;
+    let tag = server.tag();
+
+    let untrusted = chrome_connector_builder().unwrap().build();
+    let connector = server.connector_with(untrusted, "localhost", SessionPolicy::Exclusive);
+    assert!(connector.connect(&tag).await.is_err());
+
+    let connector = server.connector_with(server.tls.clone(), "other.example", SessionPolicy::Exclusive);
+    assert!(connector.connect(&tag).await.is_err());
+    assert_eq!(server.connections(), 0);
+}
+
+#[tokio::test]
+async fn insecure_accepts_untrusted_certificate() {
+    let server = FakeServer::start().await;
+    let tag = server.tag();
+
+    let connector = server.connector_with(webpki_tls(false), "localhost", SessionPolicy::Exclusive);
+    assert!(connector.connect(&tag).await.is_err());
+
+    let connector = server.connector_with(webpki_tls(true), "localhost", SessionPolicy::Exclusive);
+    let mut io = into_io(connector.connect(&tag).await.unwrap());
+    echo(&mut io, b"insecure").await;
+    assert_eq!(server.connections(), 1);
+}
+
+#[tokio::test]
+async fn configured_server_name_overrides_ip_address() {
+    let server = FakeServer::start().await;
+    let tag = server.tag();
+    assert!(tag.server.ip().is_loopback());
+
+    let connector = server.connector_with(webpki_tls(true), "v1-dy.ixigua.com", SessionPolicy::Exclusive);
+    let mut io = into_io(connector.connect(&tag).await.unwrap());
+    echo(&mut io, b"sni").await;
+
+    let connector =
+        AnyTlsConnector::new([server.addr.to_string()], target(), PASSWORD, webpki_tls(true), Default::default())
+            .unwrap();
+    let mut io = into_io(connector.connect(&tag).await.unwrap());
+    echo(&mut io, b"no sni").await;
+
+    assert_eq!(server.server_names(), [Some("v1-dy.ixigua.com".into()), None]);
 }
 
 #[tokio::test]
